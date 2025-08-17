@@ -4,9 +4,14 @@ import json
 import platform
 import psutil
 import sqlite3
+import hashlib
+import numpy as np
+import pandas as pd
+import pickle
 from datetime import datetime
-
-from PyQt5.QtWidgets import QMessageBox
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from PyQt5.QtWidgets import QMessageBox, QProgressDialog
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QApplication,
     QGridLayout, QDesktopWidget, QFrame, QPushButton, QStackedWidget,
@@ -14,8 +19,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QGroupBox, QComboBox, QDialog, QFormLayout
 )
 from PyQt5.QtGui import QPixmap, QCursor, QPainter, QPen, QColor, QKeySequence
-from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve, QRect, QTimer
-
+from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve, QRect, QTimer, pyqtSignal, QThread
 
 # Try to import WMI for better USB details on Windows (optional)
 try:
@@ -404,7 +408,221 @@ class RegisterNowPage(QWidget):
         self.parent().add_log_to_db("Product Registration", "Successfully registered")
 
 
+class AIScanner(QThread):
+    """Thread for AI-based virus scanning"""
+    scan_progress = pyqtSignal(int, str)  # Progress percentage, current file
+    scan_complete = pyqtSignal(dict)      # Results dictionary
+    
+    def __init__(self, scan_path):
+        super().__init__()
+        self.scan_path = scan_path
+        self.model = None
+        self.vectorizer = None
+        self.load_model()
+        
+    def load_model(self):
+        """Load the pre-trained AI model"""
+        try:
+            # In a real application, this would load a pre-trained model
+            # For this demo, we'll create a simple model
+            self.model = RandomForestClassifier(n_estimators=50)
+            self.vectorizer = TfidfVectorizer(max_features=1000)
+            
+            # Create dummy training data
+            benign_files = ["document.txt", "image.jpg", "data.csv", "report.pdf", "notes.docx"]
+            malicious_files = ["virus.exe", "trojan.dll", "malware.bat", "ransomware.js", "spyware.vbs"]
+            
+            # Create labels (0=benign, 1=malicious)
+            file_names = benign_files + malicious_files
+            labels = [0] * len(benign_files) + [1] * len(malicious_files)
+            
+            # Vectorize file names
+            X = self.vectorizer.fit_transform(file_names).toarray()
+            
+            # Train model
+            self.model.fit(X, labels)
+        except Exception as e:
+            print(f"Error loading model: {e}")
+    
+    def extract_features(self, file_path):
+        """Extract features from a file for AI analysis"""
+        try:
+            file_name = os.path.basename(file_path)
+            file_ext = os.path.splitext(file_name)[1].lower()
+            file_size = os.path.getsize(file_path)
+            
+            # For this demo, we'll use the file name and extension as features
+            # In a real application, you would extract more sophisticated features
+            return {
+                'name': file_name,
+                'ext': file_ext,
+                'size': file_size
+            }
+        except:
+            return None
+    
+    def predict_file(self, file_path):
+        """Use AI model to predict if a file is malicious"""
+        if not self.model or not self.vectorizer:
+            return 0.5  # Return neutral if model not loaded
+        
+        features = self.extract_features(file_path)
+        if not features:
+            return 0.5
+            
+        # Vectorize the file name
+        file_name_vector = self.vectorizer.transform([features['name']]).toarray()
+        
+        # Get prediction probability
+        prob = self.model.predict_proba(file_name_vector)[0][1]
+        
+        # Consider file size as a factor (larger files more suspicious)
+        size_factor = min(1, features['size'] / (1024 * 1024 * 10))  # Scale to 10MB
+        prob = min(1, prob + (0.3 * size_factor))
+        
+        # Consider file extension
+        risky_extensions = ['.exe', '.dll', '.bat', '.js', '.vbs', '.cmd', '.ps1', '.scr']
+        if features['ext'] in risky_extensions:
+            prob = min(1, prob + 0.2)
+            
+        return prob
+    
+    def run(self):
+        """Scan all files in the given path"""
+        results = {
+            'scanned_files': 0,
+            'malicious_files': 0,
+            'suspicious_files': 0,
+            'safe_files': 0,
+            'malicious_list': []
+        }
+        
+        # Collect all files
+        all_files = []
+        for root, dirs, files in os.walk(self.scan_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                all_files.append(file_path)
+        
+        total_files = len(all_files)
+        if total_files == 0:
+            self.scan_complete.emit(results)
+            return
+            
+        # Scan each file
+        for i, file_path in enumerate(all_files):
+            try:
+                # Update progress
+                progress = int((i + 1) / total_files * 100)
+                self.scan_progress.emit(progress, os.path.basename(file_path))
+                
+                # Predict maliciousness
+                prob = self.predict_file(file_path)
+                
+                # Classify based on probability
+                if prob > 0.8:  # High probability of being malicious
+                    results['malicious_files'] += 1
+                    results['malicious_list'].append({
+                        'path': file_path,
+                        'probability': prob,
+                        'status': 'Malicious'
+                    })
+                elif prob > 0.6:  # Suspicious
+                    results['suspicious_files'] += 1
+                    results['malicious_list'].append({
+                        'path': file_path,
+                        'probability': prob,
+                        'status': 'Suspicious'
+                    })
+                else:  # Safe
+                    results['safe_files'] += 1
+                    
+                results['scanned_files'] += 1
+            except Exception as e:
+                print(f"Error scanning {file_path}: {e}")
+                
+        self.scan_complete.emit(results)
+
+
+class ScanResultDialog(QDialog):
+    """Dialog to display virus scan results"""
+    def __init__(self, results, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Scan Results")
+        self.setMinimumSize(800, 600)
+        
+        layout = QVBoxLayout()
+        
+        # Summary section
+        summary_group = QGroupBox("Scan Summary")
+        summary_layout = QGridLayout()
+        
+        summary_layout.addWidget(QLabel("Total Files Scanned:"), 0, 0)
+        summary_layout.addWidget(QLabel(f"{results['scanned_files']}"), 0, 1)
+        
+        summary_layout.addWidget(QLabel("Safe Files:"), 1, 0)
+        safe_label = QLabel(f"{results['safe_files']}")
+        safe_label.setStyleSheet("color: green;")
+        summary_layout.addWidget(safe_label, 1, 1)
+        
+        summary_layout.addWidget(QLabel("Suspicious Files:"), 2, 0)
+        suspicious_label = QLabel(f"{results['suspicious_files']}")
+        suspicious_label.setStyleSheet("color: orange;")
+        summary_layout.addWidget(suspicious_label, 2, 1)
+        
+        summary_layout.addWidget(QLabel("Malicious Files:"), 3, 0)
+        malicious_label = QLabel(f"{results['malicious_files']}")
+        malicious_label.setStyleSheet("color: red;")
+        summary_layout.addWidget(malicious_label, 3, 1)
+        
+        summary_group.setLayout(summary_layout)
+        layout.addWidget(summary_group)
+        
+        # Details table
+        details_group = QGroupBox("Threat Details")
+        details_layout = QVBoxLayout()
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["File", "Status", "Probability"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        
+        # Populate table
+        self.table.setRowCount(len(results['malicious_list']))
+        for i, item in enumerate(results['malicious_list']):
+            self.table.setItem(i, 0, QTableWidgetItem(item['path']))
+            
+            status_item = QTableWidgetItem(item['status'])
+            if item['status'] == 'Malicious':
+                status_item.setBackground(QColor(255, 200, 200))  # Light red
+            else:
+                status_item.setBackground(QColor(255, 235, 150))  # Light yellow
+            self.table.setItem(i, 1, status_item)
+            
+            prob_item = QTableWidgetItem(f"{item['probability']:.2f}")
+            self.table.setItem(i, 2, prob_item)
+        
+        details_layout.addWidget(self.table)
+        details_group.setLayout(details_layout)
+        layout.addWidget(details_group)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+
 class USBBlockDashboard(QWidget):
+    logout_signal = pyqtSignal()
+    status_changed = pyqtSignal(str, bool)  # device_type, allowed
+    
     def __init__(self, username):
         super().__init__()
         self.username = username
@@ -413,6 +631,12 @@ class USBBlockDashboard(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setStyleSheet("background-color: white;")
         self.summary_icons = []
+        self.device_status = {
+            "usb": True,     # True = Allowed, False = Disallowed
+            "disc": True,
+            "network": True,
+            "drive": True
+        }
 
         # --- DB path & init ---
         self.db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usb_reports.db")
@@ -432,7 +656,15 @@ class USBBlockDashboard(QWidget):
         self.usb_timer = QTimer(self)
         self.usb_timer.timeout.connect(self.check_usb_changes)
         self.usb_timer.start(1000)
+        
+        # Connect status changed signal
+        self.status_changed.connect(self.handle_status_change)
 
+        # Auto-refresh Hack Attempts table every 5 seconds
+        self.hack_timer = QTimer(self)
+        self.hack_timer.timeout.connect(self.load_hack_attempts_table)
+        self.hack_timer.start(5000)
+    
     # ---------- DB ----------
     def init_db(self):
         try:
@@ -457,6 +689,17 @@ class USBBlockDashboard(QWidget):
                 )
             """)
             
+            # Create table for scan results
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scan_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    datetime TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    probability REAL
+                )
+            """)
+            
             conn.commit()
             conn.close()
         except Exception as e:
@@ -478,6 +721,19 @@ class USBBlockDashboard(QWidget):
         # Auto-refresh reports table if visible
         if getattr(self, "reports_table", None):
             self.load_reports_from_db()
+
+    def add_scan_result_to_db(self, file_path, status, probability):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO scan_results (datetime, path, status, probability) VALUES (?, ?, ?, ?)",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), file_path, status, probability)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Could not save scan result: {e}")
 
     def add_hack_attempt(self, attempt_type: str, details: str = ""):
         try:
@@ -674,7 +930,7 @@ class USBBlockDashboard(QWidget):
 
         close_btn = QPushButton("X")
         close_btn.setFixedSize(26, 26)
-        close_btn.setStyleSheet("color: white; background: none; border: none; font-size: 16px;")
+        close_btn.setStyleSheet("color: white; background: none; border: none; font-size: 16极;")
         close_btn.clicked.connect(self.close)
 
         title_bar.addWidget(minimize_btn)
@@ -738,21 +994,29 @@ class USBBlockDashboard(QWidget):
         center_grid.setContentsMargins(10, 10, 10, 10)
 
         items = [
-            ("USB Devices", "icons/usb.png", 0, 0),
-            ("Disc / Floppy Drives", "icons/disc.png", 0, 2),
-            ("Network PCs / Drives", "icons/network.png", 2, 0),
-            ("Non-System Drives", "icons/hdd.png", 2, 2)
+            ("USB Devices", "icons/usb.png", 0, 0, "usb"),
+            ("Disc / Floppy Drives", "icons/disc.png", 0, 2, "disc"),
+            ("Network PCs / Drives", "icons/network.png", 2, 0, "network"),
+            ("Non-System Drives", "icons/hdd.png", 2, 2, "drive")
         ]
         self.summary_icons = []
-        for name, icon, row, col in items:
+        self.summary_labels = {}
+        for name, icon, row, col, device_key in items:
             icon_label = QLabel()
             icon_label.setPixmap(QPixmap(icon).scaled(70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             icon_label.setAlignment(Qt.AlignCenter)
-            font_size = "16px" if name == "USB Devices" else "12px"
+            
+            # Get current status
+            status = "Allowed" if self.device_status[device_key] else "Disallowed"
+            color = "green" if self.device_status[device_key] else "red"
+            
             text = QLabel(f"<b>{name}</b><br><u><b>Status</b></u> : "
-                          f"<span style='color: green; font-size: 10px'>Allowed</span>")
+                          f"<span style='color: {color}; font-size: 10px'>{status}</span>")
             text.setAlignment(Qt.AlignCenter)
-            text.setStyleSheet(f"font-size: {font_size}; font-family: 'Times New Roman';")
+            text.setStyleSheet(f"font-size: 16px; font-family: 'Times New Roman';")
+            text.device_key = device_key  # Store device key for later updates
+            self.summary_labels[device_key] = text
+            
             layout_v = QVBoxLayout()
             layout_v.addWidget(icon_label)
             layout_v.addWidget(text)
@@ -1000,13 +1264,13 @@ class USBBlockDashboard(QWidget):
         page_layout.setSpacing(2)
 
         controls = [
-            ("icons/usb.png", "Block USB Devices", "Stop Unauthorized USB Drives, External Drives and Memory Cards."),
-            ("icons/disc.png", "Block Discs & Floppy Drives", "Stop Unauthorized CDs, DVDs, Bluray, HD and Floppy Drives."),
-            ("icons/network.png", "Block Network Access", "Stop Unauthorized Network Access to other computers."),
-            ("icons/hdd.png", "Block Non-System Drives", "Stop Unauthorized Drives and Partitions except System Drive."),
+            ("icons/usb.png", "Block USB Devices", "Stop Unauthorized USB Drives, External Drives and Memory Cards.", "usb"),
+            ("icons/disc.png", "Block Discs & Floppy Drives", "Stop Unauthorized CDs, DVDs, Bluray, HD and Floppy Drives.", "disc"),
+            ("icons/network.png", "Block Network Access", "Stop Unauthorized Network Access to other computers.", "network"),
+            ("icons/hdd.png", "Block Non-System Drives", "Stop Unauthorized Drives and Partitions except System Drive.", "drive"),
         ]
 
-        for icon_path, title_text, desc_text in controls:
+        for icon_path, title_text, desc_text, device_type in controls:
             item_widget = QWidget()
             item_layout = QHBoxLayout(item_widget)
             item_layout.setContentsMargins(20, 20, 20, 20)
@@ -1015,6 +1279,8 @@ class USBBlockDashboard(QWidget):
 
             chk = QCheckBox()
             chk.setFixedSize(30, 30)
+            # Protection enabled means checkbox checked -> device disallowed
+            chk.setChecked(not self.device_status[device_type])
             item_layout.addWidget(chk)
             chk.setStyleSheet("border:none;")
 
@@ -1032,15 +1298,25 @@ class USBBlockDashboard(QWidget):
             text_layout.addWidget(desc_lbl)
             item_layout.addLayout(text_layout)
 
-            status_lbl = QLabel("Protection: Disabled")
-            status_lbl.setStyleSheet("color: red; font-weight: bold; border:none;")
+            status_text = "Enabled" if not self.device_status[device_type] else "Disabled"
+            color = "green" if not self.device_status[device_type] else "red"
+            status_lbl = QLabel(f"Protection: {status_text}")
+            status_lbl.setStyleSheet(f"color: {color}; font-weight: bold; border:none;")
             item_layout.addStretch()
             item_layout.addWidget(status_lbl)
 
-            def toggle_status(checked, lbl=status_lbl):
-                lbl.setText("Protection: Enabled" if checked else "Protection: Disabled")
-                lbl.setStyleSheet("color: green; font-weight: bold; border:none;" if checked else "color: red; font-weight: bold; border:none;")
-            chk.stateChanged.connect(lambda state, lbl=status_lbl: toggle_status(state == Qt.Checked, lbl))
+            def toggle_status(checked, lbl=status_lbl, dev_type=device_type):
+                status_text = "Enabled" if checked else "Disabled"
+                color = "green" if checked else "red"
+                lbl.setText(f"Protection: {status_text}")
+                lbl.setStyleSheet(f"color: {color}; font-weight: bold; border:none;")
+                
+                # Update device status
+                self.device_status[dev_type] = not checked
+                # Emit signal to update summary page
+                self.status_changed.emit(dev_type, not checked)
+                
+            chk.stateChanged.connect(lambda state, lbl=status_lbl, dev_type=device_type: toggle_status(state == Qt.Checked, lbl, dev_type))
 
             item_widget.setStyleSheet("""
                 QWidget {
@@ -1074,28 +1350,83 @@ class USBBlockDashboard(QWidget):
                 background-color: #0a8a0a;
             }
         """)
-
-        def scan_usb():
-            usb_found = False
-            usb_path = None
-            for p in psutil.disk_partitions():
-                if 'removable' in (p.opts or '').lower() or ('/media' in p.mountpoint or '/mnt' in p.mountpoint):
-                    usb_found = True
-                    usb_path = p.mountpoint
-                    break
-            if not usb_found:
-                QMessageBox.warning(self, "USB Scan", "No USB device detected!")
-                return
-            # Optional: log scan start
-            self.add_log_to_db(f"Scan Started ({usb_path})", "Started")
-            QMessageBox.information(self, "USB Scan", f"Scanning files in {usb_path}...\n(Your AI model will run here.)")
-
-        go_green_btn.clicked.connect(scan_usb)
+        go_green_btn.clicked.connect(self.scan_usb)
         scan_layout.addWidget(go_green_btn)
         scan_layout.addStretch()
         page_layout.addWidget(scan_widget)
 
         return page
+
+    def scan_usb(self):
+        """Scan USB drive for viruses using AI"""
+        usb_found = False
+        usb_path = None
+        for p in psutil.disk_partitions():
+            if 'removable' in (p.opts or '').lower() or ('/media' in p.mountpoint or '/mnt' in p.mountpoint):
+                usb_found = True
+                usb_path = p.mountpoint
+                break
+        if not usb_found:
+            QMessageBox.warning(self, "USB Scan", "No USB device detected!")
+            return
+            
+        # Create progress dialog
+        self.progress_dialog = QProgressDialog("Scanning USB drive...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowTitle("AI Scanning")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setAutoReset(True)
+        
+        # Create and start scanner thread
+        self.scanner_thread = AIScanner(usb_path)
+        self.scanner_thread.scan_progress.connect(self.update_scan_progress)
+        self.scanner_thread.scan_complete.connect(self.handle_scan_results)
+        self.scanner_thread.start()
+        
+        # Log scan start
+        self.add_log_to_db(f"Scan Started ({usb_path})", "In Progress")
+        
+    def update_scan_progress(self, progress, file_name):
+        """Update progress dialog with current status"""
+        self.progress_dialog.setValue(progress)
+        self.progress_dialog.setLabelText(f"Scanning: {file_name}")
+        
+    def handle_scan_results(self, results):
+        """Handle scan completion"""
+        self.progress_dialog.close()
+        
+        # Save results to database
+        for item in results['malicious_list']:
+            self.add_scan_result_to_db(item['path'], item['status'], item['probability'])
+        
+        # Show results dialog
+        result_dialog = ScanResultDialog(results, self)
+        result_dialog.exec_()
+        
+        # Log scan completion
+        status = "Completed"
+        if results['malicious_files'] > 0 or results['suspicious_files'] > 0:
+            status = "Threats Found"
+        self.add_log_to_db(f"Scan Completed ({results['scanned_files']} files)", status)
+        
+        # Show summary message
+        msg = (f"Scan completed!\n\n"
+               f"Files scanned: {results['scanned_files']}\n"
+               f"Safe files: {results['safe_files']}\n"
+               f"Suspicious files: {results['suspicious_files']}\n"
+               f"Malicious files: {results['malicious_files']}")
+               
+        QMessageBox.information(self, "Scan Complete", msg)
+
+    def handle_status_change(self, device_type, allowed):
+        """Update the summary page when device status changes"""
+        if device_type in self.summary_labels:
+            status = "Allowed" if allowed else "Disallowed"
+            color = "green" if allowed else "red"
+            self.summary_labels[device_type].setText(
+                f"<b>{self.summary_labels[device_type].text().split('<br>')[0]}</b><br>"
+                f"<u><b>Status</b></u> : <span style='color: {color}; font-size: 10px'>{status}</span>"
+            )
 
     # ---------- Authorized Devices Page ----------
     def create_authorized_devices_page(self):
@@ -1228,7 +1559,7 @@ class USBBlockDashboard(QWidget):
         stealth_group = QGroupBox("Stealth Options")
         stealth_group.setStyleSheet("""
             QGroupBox {
-                font-size: 16px;
+                font-size: 18px;
                 font-weight: bold;
                 border: 1px solid #f2b6b6;
                 border-radius: 5px;
@@ -1260,7 +1591,7 @@ class USBBlockDashboard(QWidget):
         hotkey_layout.addWidget(hotkey_label)
         
         self.hotkey_input = HotkeyInput()
-        self.hotkey_input.setStyleSheet("font-size: 14px;")
+        self.hotkey_input.setStyleSheet("font-size: 14px; background-color:#d32f2f; color:white; font-weight:bold;")
         self.hotkey_input.setText("Ctrl+Alt+Shift+A")
         hotkey_layout.addWidget(self.hotkey_input)
         hotkey_layout.addStretch()
@@ -1449,18 +1780,39 @@ class USBBlockDashboard(QWidget):
                 "Please log in with an administrator account to change passwords."
             )
             return
-            
+
         # For non-guest users, show password change dialog
         dialog = ChangePasswordDialog(self)
         if dialog.exec_() == QDialog.Accepted:
-            # In a real app, you would update the password hash here
-            QMessageBox.information(
-                self,
-                "Password Changed",
-                "Your password has been changed successfully."
-            )
-            self.add_hack_attempt("Password Changed", "User changed their password")
-            
+            old_pass = dialog.old_password.text()
+            new_pass = dialog.new_password.text()
+
+            try:
+                users_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.db")
+                conn = sqlite3.connect(users_db)
+                cur = conn.cursor()
+
+                def hash_password(p):
+                    return hashlib.sha256(p.encode()).hexdigest()
+
+                # Verify old password
+                cur.execute("SELECT password FROM users WHERE username=?", (self.username,))
+                row = cur.fetchone()
+                if not row or row[0] != hash_password(old_pass):
+                    QMessageBox.warning(self, "Error", "Old password is incorrect.")
+                    conn.close()
+                    return
+
+                # Update to new password
+                cur.execute("UPDATE users SET password=? WHERE username=?", (hash_password(new_pass), self.username))
+                conn.commit()
+                conn.close()
+
+                QMessageBox.information(self, "Password Changed", "Your password has been changed successfully.")
+                self.add_hack_attempt("Password Changed", f"User {self.username} changed their password")
+            except Exception as e:
+                QMessageBox.warning(self, "Database Error", f"Could not update password:\n{e}")
+
     def logout(self):
         """Handle logout process"""
         reply = QMessageBox.question(
@@ -1472,15 +1824,8 @@ class USBBlockDashboard(QWidget):
         )
         
         if reply == QMessageBox.Yes:
-            # In a real application, you would return to the login screen
-            # For this demo, we'll just close the application
+            self.logout_signal.emit()
             self.close()
-            # Add any additional logout logic here
-            QMessageBox.information(
-                None, 
-                "Logged Out", 
-                "You have been successfully logged out."
-            )
 
     def save_program_options(self):
         """Save all program options from the settings page."""
@@ -1505,7 +1850,6 @@ class USBBlockDashboard(QWidget):
         # Log the settings change
         self.add_log_to_db("Program Options Changed", "Settings Updated")
 
-    # ---------- Helpers ----------
     def create_placeholder_page(self, text):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1530,4 +1874,6 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     win = USBBlockDashboard("Guest")
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec_())  
+
+## sql lite is addedd . solve the issue of password changes real time usb monitoring and real time database update
