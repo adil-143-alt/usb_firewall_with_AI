@@ -4,21 +4,45 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 import sqlite3
+import hashlib
+import os
+from datetime import datetime
+
+# Path to the same DB the dashboard uses for hack attempts
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usb_reports.db")
+
+
+def log_hack_attempt(attempt_type: str, details: str = ""):
+    """Log hack attempts (failed login, signup issues) to usb_reports.db"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS hack_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                datetime TEXT NOT NULL,
+                attempt_type TEXT NOT NULL,
+                details TEXT
+            )
+        """)
+        conn.commit()
+        cur.execute(
+            "INSERT INTO hack_attempts (datetime, attempt_type, details) VALUES (?, ?, ?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), attempt_type, details)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Hack Log Error] {e}")
 
 
 class AuthWindow(QDialog):
-    """
-    Authentication dialog for USB Firewall.
-    Supports login, signup, and guest modes.
-    Tracks guest mode so main window can restrict Control Center.
-    """
     def __init__(self, mode="login"):
         super().__init__()
         self.mode = mode
-        self.username_value = None  # Stores logged-in / created / guest name
-        self.is_guest = False       # True if the logged-in user is guest
+        self.username_value = None
+        self.is_guest = False
 
-        # --- Window Setup ---
         self.setWindowTitle(f"USB Firewall - {mode.capitalize()}")
         if self.mode == "login":
             self.setFixedSize(400, 250)
@@ -27,7 +51,6 @@ class AuthWindow(QDialog):
         elif self.mode == "guest":
             self.setFixedSize(400, 200)
 
-        # Styling
         self.setStyleSheet("""
             QDialog {
                 background-color: #fff5f5;
@@ -58,22 +81,18 @@ class AuthWindow(QDialog):
         self.init_db()
 
     def bold_label(self, text, size):
-        """Helper to create a bold QLabel with given size."""
         label = QLabel(text)
         label.setStyleSheet(f"font-size: {size}px; font-weight: bold; margin-bottom: 8px;")
         return label
 
     def init_ui(self):
-        """Create UI elements based on mode."""
         layout = QVBoxLayout()
 
         if self.mode == "login":
             layout.addWidget(self.bold_label("Login to continue:", 20))
-
             self.username = QLineEdit()
             self.username.setPlaceholderText("Username")
             layout.addWidget(self.username)
-
             self.password = QLineEdit()
             self.password.setPlaceholderText("Password")
             self.password.setEchoMode(QLineEdit.Password)
@@ -81,16 +100,13 @@ class AuthWindow(QDialog):
 
         elif self.mode == "signup":
             layout.addWidget(self.bold_label("Create a new account:", 20))
-
             self.username = QLineEdit()
             self.username.setPlaceholderText("Name")
             layout.addWidget(self.username)
-
             self.password = QLineEdit()
             self.password.setPlaceholderText("Password")
             self.password.setEchoMode(QLineEdit.Password)
             layout.addWidget(self.password)
-
             self.confirm_password = QLineEdit()
             self.confirm_password.setPlaceholderText("Confirm Password")
             self.confirm_password.setEchoMode(QLineEdit.Password)
@@ -98,12 +114,10 @@ class AuthWindow(QDialog):
 
         elif self.mode == "guest":
             layout.addWidget(self.bold_label("Continue as Guest:", 20))
-
             self.guest_name = QLineEdit()
             self.guest_name.setPlaceholderText("Enter your name")
             layout.addWidget(self.guest_name)
 
-        # --- Buttons ---
         btn_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
         cancel_btn = QPushButton("Cancel")
@@ -116,7 +130,6 @@ class AuthWindow(QDialog):
         self.setLayout(layout)
 
     def init_db(self):
-        """Initialize SQLite database for storing users."""
         self.conn = sqlite3.connect("users.db")
         self.cursor = self.conn.cursor()
         self.cursor.execute("""
@@ -127,12 +140,15 @@ class AuthWindow(QDialog):
         """)
         self.conn.commit()
 
+    def hash_password(self, password):
+        return hashlib.sha256(password.encode()).hexdigest()
+
     def handle_ok(self):
-        """Handle button clicks for all modes."""
         if self.mode == "login":
             user = self.username.text()
             pw = self.password.text()
-            self.cursor.execute("SELECT * FROM users WHERE username=? AND password=?", (user, pw))
+            hashed_pw = self.hash_password(pw)
+            self.cursor.execute("SELECT * FROM users WHERE username=? AND password=?", (user, hashed_pw))
             result = self.cursor.fetchone()
             if result:
                 self.username_value = user
@@ -141,20 +157,21 @@ class AuthWindow(QDialog):
                 self.accept()
             else:
                 QMessageBox.warning(self, "Login Failed", "Incorrect username or password.")
+                log_hack_attempt("Failed Login", f"Username: {user}")
 
         elif self.mode == "signup":
             user = self.username.text()
             pw = self.password.text()
             confirm_pw = self.confirm_password.text()
-
             if not (user and pw and confirm_pw):
                 QMessageBox.warning(self, "Error", "All fields are required.")
                 return
             if pw != confirm_pw:
                 QMessageBox.warning(self, "Error", "Passwords do not match.")
                 return
+            hashed_pw = self.hash_password(pw)
             try:
-                self.cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (user, pw))
+                self.cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (user, hashed_pw))
                 self.conn.commit()
                 self.username_value = user
                 self.is_guest = False
@@ -162,6 +179,7 @@ class AuthWindow(QDialog):
                 self.accept()
             except sqlite3.IntegrityError:
                 QMessageBox.warning(self, "Error", "Username already exists.")
+                log_hack_attempt("Signup Failed", f"Duplicate username attempted: {user}")
 
         elif self.mode == "guest":
             name = self.guest_name.text()
@@ -169,6 +187,6 @@ class AuthWindow(QDialog):
                 QMessageBox.warning(self, "Error", "Name is required.")
                 return
             self.username_value = name
-            self.is_guest = True  # Mark as guest
+            self.is_guest = True
             QMessageBox.information(self, "Welcome", f"Hello {name}, you are in guest mode.")
             self.accept()
