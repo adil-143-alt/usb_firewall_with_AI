@@ -11,3 +11,4 @@ pip install pycryptodome
 pip install requests
 pip install python-dotenv
 pip install PyQt5
+
