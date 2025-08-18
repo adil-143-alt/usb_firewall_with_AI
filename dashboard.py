@@ -1875,5 +1875,6 @@ if __name__ == '__main__':
     win = USBBlockDashboard("Guest")
     win.show()
     sys.exit(app.exec_())  
-
+## This application is not fully functionable . I am working on it daily and will make it complete soon.
 ## sql lite is addedd . solve the issue of password changes real time usb monitoring and real time database update
+
