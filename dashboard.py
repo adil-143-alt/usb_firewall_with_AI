@@ -8,18 +8,29 @@ import hashlib
 import numpy as np
 import pandas as pd
 import pickle
+import math
+import shutil
+import time
+import threading
+import requests
 from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from PyQt5.QtWidgets import QMessageBox, QProgressDialog
 from PyQt5.QtWidgets import (
-    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QApplication,
+    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QApplication, QProgressBar,
     QGridLayout, QDesktopWidget, QFrame, QPushButton, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QFileDialog,
-    QLineEdit, QGroupBox, QComboBox, QDialog, QFormLayout
+    QLineEdit, QGroupBox, QComboBox, QDialog, QFormLayout, QAction, QMenu, QSizePolicy
 )
-from PyQt5.QtGui import QPixmap, QCursor, QPainter, QPen, QColor, QKeySequence
+from PyQt5.QtGui import QPixmap, QCursor, QPainter, QPen, QColor, QKeySequence, QFont, QIcon
 from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve, QRect, QTimer, pyqtSignal, QThread
+
+# Enable High DPI scaling
+if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
 # Try to import WMI for better USB details on Windows (optional)
 try:
@@ -38,12 +49,36 @@ try:
 except Exception:
     HAS_REPORTLAB = False
 
+# Try to import pywin32 for USB blocking on Windows
+try:
+    import win32file
+    import win32api
+    import win32security
+    import ntsecuritycon
+    HAS_WIN32 = True
+except Exception:
+    HAS_WIN32 = False
+
+# Try to import pefile for PE analysis
+try:
+    import pefile
+    HAS_PEFILE = True
+except Exception:
+    HAS_PEFILE = False
+
+# Try to import yara for pattern matching
+try:
+    import yara
+    HAS_YARA = True
+except Exception:
+    HAS_YARA = False
+
 
 class ChangePasswordDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Change Password")
-        self.setFixedSize(400, 250)
+        self.setMinimumSize(400, 250)
         
         layout = QVBoxLayout()
         
@@ -131,7 +166,7 @@ class ClickableMenuItem(QWidget):
         layout.addWidget(text_label)
 
         self.setLayout(layout)
-        self.setFixedWidth(140)
+        self.setMinimumWidth(140)
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.setStyleSheet("background-color: transparent;")
 
@@ -408,8 +443,162 @@ class RegisterNowPage(QWidget):
         self.parent().add_log_to_db("Product Registration", "Successfully registered")
 
 
+class USBPortManager:
+    """Class to manage USB port blocking/unblocking on Windows"""
+    
+    def __init__(self):
+        self.usb_devices = []
+        self.blocked_ports = set()
+        
+    def get_usb_devices(self):
+        """Get list of USB devices"""
+        self.usb_devices = []
+        try:
+            if platform.system() == "Windows" and HAS_WMI:
+                c = wmi.WMI()
+                for device in c.Win32_USBHub():
+                    self.usb_devices.append({
+                        'name': device.Name,
+                        'device_id': device.DeviceID,
+                        'status': 'Enabled'
+                    })
+        except Exception as e:
+            print(f"Error getting USB devices: {e}")
+        return self.usb_devices
+    
+    def block_usb_ports(self):
+        """Block USB ports by disabling them in device manager"""
+        try:
+            if platform.system() == "Windows" and HAS_WIN32:
+                # This is a simplified approach - in a real application, you would
+                # use more sophisticated methods to disable USB ports
+                self.blocked_ports = set()
+                
+                # Get all USB devices
+                c = wmi.WMI()
+                for usb in c.Win32_USBControllerDevice():
+                    device_id = usb.Dependent.DeviceID
+                    self.blocked_ports.add(device_id)
+                    
+                    # Try to disable the device (requires admin privileges)
+                    try:
+                        # This would require running as administrator
+                        os.system(f'pnputil /disable-device "{device_id}"')
+                    except:
+                        pass
+                        
+                return True
+            else:
+                return False
+        except Exception as e:
+            print(f"Error blocking USB ports: {e}")
+            return False
+    
+    def unblock_usb_ports(self):
+        """Unblock USB ports by enabling them in device manager"""
+        try:
+            if platform.system() == "Windows" and HAS_WIN32:
+                for device_id in self.blocked_ports:
+                    # Try to enable the device (requires admin privileges)
+                    try:
+                        os.system(f'pnputil /enable-device "{device_id}"')
+                    except:
+                        pass
+                self.blocked_ports.clear()
+                return True
+            else:
+                return False
+        except Exception as e:
+            print(f"Error unblocking USB ports: {e}")
+            return False
+
+
+class ScanProgressDialog(QDialog):
+    """Custom progress dialog for scanning with better UI"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI Scanning")
+        self.setMinimumSize(500, 150)
+        self.setWindowModality(Qt.WindowModal)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f5f5f5;
+                border: 2px solid #1976D2;
+                border-radius: 8px;
+            }
+            QLabel {
+                font-size: 14px;
+                color: #333;
+            }
+            QProgressBar {
+                border: 2px solid #ccc;
+                border-radius: 5px;
+                text-align: center;
+                height: 20px;
+                background-color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                width: 10px;
+                border-radius: 3px;
+            }
+        """)
+        
+        layout = QVBoxLayout()
+        
+        # Title
+        title_label = QLabel("Scanning USB Drive for Threats")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #1976D2;")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+        
+        # Status label
+        self.status_label = QLabel("Initializing...")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+        
+        # Cancel button
+        self.cancel_btn = QPushButton("Cancel Scan")
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #b71c1c;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self.cancel_scan)
+        layout.addWidget(self.cancel_btn)
+        
+        self.setLayout(layout)
+        
+        self.cancelled = False
+    
+    def update_progress(self, value, text):
+        """Update progress bar and status text"""
+        self.progress_bar.setValue(value)
+        self.status_label.setText(text)
+        QApplication.processEvents()  # Keep UI responsive
+    
+    def cancel_scan(self):
+        """Handle cancel button click"""
+        self.cancelled = True
+        self.status_label.setText("Cancelling scan...")
+        self.cancel_btn.setEnabled(False)
+
+
 class AIScanner(QThread):
-    """Thread for AI-based virus scanning"""
+    """Thread for AI-based virus scanning with enhanced detection methods"""
     scan_progress = pyqtSignal(int, str)  # Progress percentage, current file
     scan_complete = pyqtSignal(dict)      # Results dictionary
     
@@ -418,74 +607,265 @@ class AIScanner(QThread):
         self.scan_path = scan_path
         self.model = None
         self.vectorizer = None
+        self.quarantine_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quarantine")
+        self.yara_rules = None
         self.load_model()
+        self.load_yara_rules()
         
+        # Known malicious file hashes (in a real app, this would be a database)
+        self.malicious_hashes = {
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",  # Empty file (example)
+        }
+        
+        # Create quarantine directory if it doesn't exist
+        if not os.path.exists(self.quarantine_path):
+            os.makedirs(self.quarantine_path)
+    
     def load_model(self):
-        """Load the pre-trained AI model"""
+        """Load or create a detection model"""
         try:
-            # In a real application, this would load a pre-trained model
-            # For this demo, we'll create a simple model
-            self.model = RandomForestClassifier(n_estimators=50)
-            self.vectorizer = TfidfVectorizer(max_features=1000)
-            
-            # Create dummy training data
-            benign_files = ["document.txt", "image.jpg", "data.csv", "report.pdf", "notes.docx"]
-            malicious_files = ["virus.exe", "trojan.dll", "malware.bat", "ransomware.js", "spyware.vbs"]
-            
-            # Create labels (0=benign, 1=malicious)
-            file_names = benign_files + malicious_files
-            labels = [0] * len(benign_files) + [1] * len(malicious_files)
-            
-            # Vectorize file names
-            X = self.vectorizer.fit_transform(file_names).toarray()
-            
-            # Train model
-            self.model.fit(X, labels)
+            # Try to load a pre-trained model if it exists
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ember_rf_model.pkl")
+            if os.path.exists(model_path):
+                with open(model_path, 'rb') as f:
+                    self.model = pickle.load(f)
+                print("Loaded pre-trained model from ember_rf_model")
+            else:
+                # Create a simple model for demonstration
+                print("Creating new detection model...")
+                self.create_detection_model()
         except Exception as e:
             print(f"Error loading model: {e}")
+            self.create_detection_model()
+    
+    def create_detection_model(self):
+        """Create a detection model based on heuristic rules"""
+        # This is a simplified model - in a real application, you would use
+        # a properly trained machine learning model
+        self.model = {
+            'threshold': 0.7,
+            'rules': {
+                'high_entropy': 0.3,
+                'executable': 0.4,
+                'double_extension': 0.8,
+                'system_files': 0.6,
+                'suspicious_names': 0.5
+            }
+        }
+        print("Created heuristic detection model")
+    
+    def load_yara_rules(self):
+        """Load YARA rules for pattern matching"""
+        try:
+            if HAS_YARA:
+                # Create basic YARA rules if file doesn't exist
+                rules_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "malware_rules.yar")
+                if not os.path.exists(rules_path):
+                    self.create_default_yara_rules(rules_path)
+                
+                self.yara_rules = yara.compile(rules_path)
+                print("Loaded YARA rules from malware_rules.yar")
+            else:
+                print("YARA not available")
+                self.yara_rules = None
+        except Exception as e:
+            print(f"Error loading YARA rules: {e}")
+            self.yara_rules = None
+    
+    def create_default_yara_rules(self, rules_path):
+        """Create default YARA rules if file doesn't exist"""
+        default_rules = """
+rule SuspiciousScripts {
+    strings:
+        $cmd1 = "cmd.exe" nocase
+        $cmd2 = "/c" nocase
+        $powershell = "powershell" nocase
+        $regsvr = "regsvr32" nocase
+        $sc = "sc create" nocase
+    condition:
+        any of them
+}
+
+rule ExecutablePatterns {
+    strings:
+        $mz = { 4D 5A }  // MZ header for PE files
+    condition:
+        $mz at 0
+}
+
+rule ObfuscatedCode {
+    strings:
+        $eval = "eval(" nocase
+        $exec = "exec(" nocase
+        $fromcharcode = "fromCharCode" nocase
+        $charcode = "charCodeAt" nocase
+    condition:
+        any of them
+}
+"""
+        try:
+            with open(rules_path, 'w') as f:
+                f.write(default_rules)
+            print("Created default YARA rules")
+        except Exception as e:
+            print(f"Error creating YARA rules: {e}")
+    
+    def calculate_entropy(self, data):
+        """Calculate the entropy of a data chunk"""
+        if not data:
+            return 0
+            
+        entropy = 0
+        for x in range(256):
+            p_x = float(data.count(x)) / len(data)
+            if p_x > 0:
+                entropy += - p_x * math.log(p_x, 2)
+                
+        return entropy
+    
+    def calculate_file_hash(self, file_path):
+        """Calculate SHA256 hash of a file"""
+        sha256_hash = hashlib.sha256()
+        try:
+            with open(file_path, "rb") as f:
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+            return sha256_hash.hexdigest()
+        except:
+            return None
+    
+    def check_virustotal(self, file_hash):
+        """Check file hash against VirusTotal (requires API key)"""
+        # This is a placeholder - in a real application, you would use
+        # the VirusTotal API with a valid API key
+        return 0.0  # Return 0 for demo purposes
     
     def extract_features(self, file_path):
-        """Extract features from a file for AI analysis"""
+        """Extract features from a file for analysis"""
         try:
             file_name = os.path.basename(file_path)
             file_ext = os.path.splitext(file_name)[1].lower()
             file_size = os.path.getsize(file_path)
             
-            # For this demo, we'll use the file name and extension as features
-            # In a real application, you would extract more sophisticated features
-            return {
-                'name': file_name,
-                'ext': file_ext,
-                'size': file_size
+            # Calculate entropy of the file
+            entropy = 0
+            try:
+                with open(file_path, 'rb') as f:
+                    data = f.read(4096)  # Read first 4KB
+                    entropy = self.calculate_entropy(data)
+            except:
+                entropy = 0
+            
+            # Check for suspicious file attributes
+            is_executable = file_ext in ['.exe', '.dll', '.bat', '.cmd', '.ps1', '.vbs', '.js', '.scr', '.com', '.pif']
+            is_hidden = os.name == 'nt' and bool(os.stat(file_path).st_file_attributes & 2)
+            has_double_extension = file_name.count('.') > 1 and len(file_ext) > 0
+            
+            # Check for suspicious names
+            suspicious_names = ['cmd', 'powershell', 'wscript', 'cscript', 'regsvr32', 'sc', 'install', 'setup', 'update']
+            is_suspicious_name = any(name in file_name.lower() for name in suspicious_names)
+            
+            # Check if file is in system locations
+            system_locations = ['windows', 'system32', 'syswow64', 'program files', 'programdata']
+            is_system_file = any(loc in file_path.lower() for loc in system_locations)
+            
+            features = {
+                'name_length': len(file_name),
+                'ext_length': len(file_ext),
+                'size': file_size,
+                'entropy': entropy,
+                'is_executable': 1 if is_executable else 0,
+                'is_hidden': 1 if is_hidden else 0,
+                'double_extension': 1 if has_double_extension else 0,
+                'suspicious_name': 1 if is_suspicious_name else 0,
+                'system_file': 1 if is_system_file else 0
             }
+            
+            return features
         except:
             return None
     
+    def yara_scan(self, file_path):
+        """Scan file using YARA rules"""
+        if not self.yara_rules:
+            return 0.0
+            
+        try:
+            matches = self.yara_rules.match(file_path)
+            if matches:
+                # Return a higher probability based on number of matches
+                return min(1.0, 0.3 + (len(matches) * 0.1))
+        except:
+            pass
+            
+        return 0.0
+    
     def predict_file(self, file_path):
-        """Use AI model to predict if a file is malicious"""
-        if not self.model or not self.vectorizer:
-            return 0.5  # Return neutral if model not loaded
-        
+        """Use heuristic analysis to predict if a file is malicious"""
         features = self.extract_features(file_path)
         if not features:
             return 0.5
             
-        # Vectorize the file name
-        file_name_vector = self.vectorizer.transform([features['name']]).toarray()
+        # Calculate probability based on heuristic rules
+        probability = 0.0
         
-        # Get prediction probability
-        prob = self.model.predict_proba(file_name_vector)[0][1]
+        # High entropy (often indicates encrypted or compressed content)
+        if features['entropy'] > 7.0:
+            probability += self.model['rules']['high_entropy']
         
-        # Consider file size as a factor (larger files more suspicious)
-        size_factor = min(1, features['size'] / (1024 * 1024 * 10))  # Scale to 10MB
-        prob = min(1, prob + (0.3 * size_factor))
+        # Executable files
+        if features['is_executable']:
+            probability += self.model['rules']['executable']
         
-        # Consider file extension
-        risky_extensions = ['.exe', '.dll', '.bat', '.js', '.vbs', '.cmd', '.ps1', '.scr']
-        if features['ext'] in risky_extensions:
-            prob = min(1, prob + 0.2)
+        # Double extensions (e.g., "document.pdf.exe")
+        if features['double_extension']:
+            probability += self.model['rules']['double_extension']
+        
+        # System files in non-system locations
+        if features['system_file'] and not any(loc in file_path.lower() for loc in ['windows', 'system32', 'syswow64']):
+            probability += self.model['rules']['system_files']
+        
+        # Suspicious names
+        if features['suspicious_name']:
+            probability += self.model['rules']['suspicious_names']
+        
+        # Add YARA scan results
+        yara_prob = self.yara_scan(file_path)
+        probability = min(1.0, probability + yara_prob)
+        
+        # Check file hash against known malicious hashes
+        file_hash = self.calculate_file_hash(file_path)
+        if file_hash and file_hash in self.malicious_hashes:
+            probability = 1.0
             
-        return prob
+        return probability
+    
+    def quarantine_file(self, file_path):
+        """Move a file to quarantine"""
+        try:
+            file_name = os.path.basename(file_path)
+            quarantine_file = os.path.join(self.quarantine_path, file_name)
+            
+            # If file already exists in quarantine, add a timestamp
+            if os.path.exists(quarantine_file):
+                base, ext = os.path.splitext(file_name)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                quarantine_file = os.path.join(self.quarantine_path, f"{base}_{timestamp}{ext}")
+            
+            shutil.move(file_path, quarantine_file)
+            return True
+        except Exception as e:
+            print(f"Error quarantining file {file_path}: {e}")
+            return False
+    
+    def delete_file(self, file_path):
+        """Permanently delete a file"""
+        try:
+            os.remove(file_path)
+            return True
+        except Exception as e:
+            print(f"Error deleting file {file_path}: {e}")
+            return False
     
     def run(self):
         """Scan all files in the given path"""
@@ -494,62 +874,91 @@ class AIScanner(QThread):
             'malicious_files': 0,
             'suspicious_files': 0,
             'safe_files': 0,
-            'malicious_list': []
+            'file_list': []  # List of all files with their status
         }
         
         # Collect all files
         all_files = []
-        for root, dirs, files in os.walk(self.scan_path):
-            for file in files:
-                file_path = os.path.join(root, file)
-                all_files.append(file_path)
+        try:
+            for root, dirs, files in os.walk(self.scan_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    all_files.append(file_path)
+        except Exception as e:
+            print(f"Error walking directory: {e}")
+            self.scan_complete.emit(results)
+            return
         
         total_files = len(all_files)
         if total_files == 0:
             self.scan_complete.emit(results)
             return
             
+        # Minimum scan duration (3 seconds)
+        start_time = time.time()
+        min_duration = 3.0
+        
         # Scan each file
         for i, file_path in enumerate(all_files):
             try:
-                # Update progress
-                progress = int((i + 1) / total_files * 100)
+                # Update progress with realistic timing
+                elapsed = time.time() - start_time
+                progress = min(95, int((i + 1) / total_files * 100))
+                
+                # Add small delay to make scanning visible
+                time.sleep(0.05)
+                
                 self.scan_progress.emit(progress, os.path.basename(file_path))
                 
                 # Predict maliciousness
                 prob = self.predict_file(file_path)
                 
                 # Classify based on probability
+                file_info = {
+                    'path': file_path,
+                    'probability': prob,
+                    'status': 'Safe'
+                }
+                
                 if prob > 0.8:  # High probability of being malicious
                     results['malicious_files'] += 1
-                    results['malicious_list'].append({
-                        'path': file_path,
-                        'probability': prob,
-                        'status': 'Malicious'
-                    })
+                    file_info['status'] = 'Malicious'
                 elif prob > 0.6:  # Suspicious
                     results['suspicious_files'] += 1
-                    results['malicious_list'].append({
-                        'path': file_path,
-                        'probability': prob,
-                        'status': 'Suspicious'
-                    })
+                    file_info['status'] = 'Suspicious'
                 else:  # Safe
                     results['safe_files'] += 1
                     
+                results['file_list'].append(file_info)
                 results['scanned_files'] += 1
             except Exception as e:
                 print(f"Error scanning {file_path}: {e}")
                 
+        # Ensure minimum scan duration
+        elapsed = time.time() - start_time
+        if elapsed < min_duration:
+            remaining = min_duration - elapsed
+            steps = int(remaining / 0.1)
+            for i in range(steps):
+                progress = min(99, 95 + int((i + 1) / steps * 5))
+                self.scan_progress.emit(progress, "Finalizing scan...")
+                time.sleep(0.1)
+        
+        # Final progress update
+        self.scan_progress.emit(100, "Scan complete!")
+        time.sleep(0.2)  # Brief pause to show 100%
+        
         self.scan_complete.emit(results)
 
 
 class ScanResultDialog(QDialog):
-    """Dialog to display virus scan results"""
+    """Dialog to display virus scan results with action options"""
     def __init__(self, results, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Scan Results")
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(900, 700)
+        self.results = results
+        self.parent_ref = parent
         
         layout = QVBoxLayout()
         
@@ -562,46 +971,102 @@ class ScanResultDialog(QDialog):
         
         summary_layout.addWidget(QLabel("Safe Files:"), 1, 0)
         safe_label = QLabel(f"{results['safe_files']}")
-        safe_label.setStyleSheet("color: green;")
+        safe_label.setStyleSheet("color: green; font-weight: bold;")
         summary_layout.addWidget(safe_label, 1, 1)
         
         summary_layout.addWidget(QLabel("Suspicious Files:"), 2, 0)
         suspicious_label = QLabel(f"{results['suspicious_files']}")
-        suspicious_label.setStyleSheet("color: orange;")
+        suspicious_label.setStyleSheet("color: orange; font-weight: bold;")
         summary_layout.addWidget(suspicious_label, 2, 1)
         
         summary_layout.addWidget(QLabel("Malicious Files:"), 3, 0)
         malicious_label = QLabel(f"{results['malicious_files']}")
-        malicious_label.setStyleSheet("color: red;")
+        malicious_label.setStyleSheet("color: red; font-weight: bold;")
         summary_layout.addWidget(malicious_label, 3, 1)
         
         summary_group.setLayout(summary_layout)
         layout.addWidget(summary_group)
         
+        # Action buttons
+        if results['malicious_files'] > 0 or results['suspicious_files'] > 0:
+            action_group = QGroupBox("Actions")
+            action_layout = QHBoxLayout()
+            
+            quarantine_btn = QPushButton("Quarantine All Threats")
+            quarantine_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+            quarantine_btn.clicked.connect(self.quarantine_all)
+            action_layout.addWidget(quarantine_btn)
+            
+            delete_btn = QPushButton("Delete All Threats")
+            delete_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold;")
+            delete_btn.clicked.connect(self.delete_all)
+            action_layout.addWidget(delete_btn)
+            
+            action_group.setLayout(action_layout)
+            layout.addWidget(action_group)
+        
         # Details table
-        details_group = QGroupBox("Threat Details")
+        details_group = QGroupBox("Scan Details")
         details_layout = QVBoxLayout()
         
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["File", "Status", "Probability"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["File", "Status", "Probability", "Action"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         
-        # Populate table
-        self.table.setRowCount(len(results['malicious_list']))
-        for i, item in enumerate(results['malicious_list']):
+        # Add context menu for individual file actions
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+        
+        # Populate table with all files
+        self.table.setRowCount(len(results['file_list']))
+        for i, item in enumerate(results['file_list']):
             self.table.setItem(i, 0, QTableWidgetItem(item['path']))
             
             status_item = QTableWidgetItem(item['status'])
             if item['status'] == 'Malicious':
                 status_item.setBackground(QColor(255, 200, 200))  # Light red
-            else:
+                status_item.setForeground(QColor(255, 0, 0))
+            elif item['status'] == 'Suspicious':
                 status_item.setBackground(QColor(255, 235, 150))  # Light yellow
+                status_item.setForeground(QColor(255, 140, 0))
+            else:
+                status_item.setBackground(QColor(200, 255, 200))  # Light green
+                status_item.setForeground(QColor(0, 128, 0))
+                
+            status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(i, 1, status_item)
             
             prob_item = QTableWidgetItem(f"{item['probability']:.2f}")
+            prob_item.setFlags(prob_item.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(i, 2, prob_item)
+            
+            # Add action buttons for suspicious and malicious files
+            action_widget = QWidget()
+            action_layout = QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(3, 3, 3, 3)
+            
+            if item['status'] in ['Malicious', 'Suspicious']:
+                quarantine_btn = QPushButton("Quarantine")
+                quarantine_btn.setStyleSheet("background-color: #FF9800; color: white; font-size: 10px;")
+                quarantine_btn.clicked.connect(lambda checked, path=item['path']: self.quarantine_file(path))
+                action_layout.addWidget(quarantine_btn)
+                
+                delete_btn = QPushButton("Delete")
+                delete_btn.setStyleSheet("background-color: #F44336; color: white; font-size: 10px;")
+                delete_btn.clicked.connect(lambda checked, path=item['path']: self.delete_file(path))
+                action_layout.addWidget(delete_btn)
+            else:
+                # Safe file - show checkmark icon
+                safe_label = QLabel()
+                safe_label.setPixmap(QPixmap("icons/safe.png").scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                safe_label.setAlignment(Qt.AlignCenter)
+                action_layout.addWidget(safe_label)
+            
+            action_layout.addStretch()
+            action_widget.setLayout(action_layout)
+            self.table.setCellWidget(i, 3, action_widget)
         
         details_layout.addWidget(self.table)
         details_group.setLayout(details_layout)
@@ -611,12 +1076,162 @@ class ScanResultDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         
+        export_btn = QPushButton("Export Report")
+        export_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        export_btn.clicked.connect(self.export_report)
+        btn_layout.addWidget(export_btn)
+        
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
         
         layout.addLayout(btn_layout)
         self.setLayout(layout)
+    
+    def export_report(self):
+        """Export scan results to a CSV file"""
+        options = QFileDialog.Options()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Scan Report", "scan_report.csv", "CSV Files (*.csv)", options=options
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write("File Path,Status,Probability\n")
+                    for item in self.results['file_list']:
+                        f.write(f'"{item["path"]}",{item["status"]},{item["probability"]:.2f}\n')
+                
+                QMessageBox.information(self, "Export Successful", f"Scan report exported to:\n{file_path}")
+            except Exception as e:
+                QMessageBox.warning(self, "Export Error", f"Failed to export report:\n{e}")
+    
+    def show_context_menu(self, position):
+        """Show context menu for right-click actions"""
+        row = self.table.rowAt(position.y())
+        if row < 0:
+            return
+            
+        menu = QMenu()
+        file_path = self.table.item(row, 0).text()
+        status = self.table.item(row, 1).text()
+        
+        if status in ['Malicious', 'Suspicious']:
+            quarantine_action = menu.addAction("Quarantine File")
+            delete_action = menu.addAction("Delete File")
+            
+            action = menu.exec_(self.table.mapToGlobal(position))
+            
+            if action == quarantine_action:
+                self.quarantine_file(file_path)
+            elif action == delete_action:
+                self.delete_file(file_path)
+    
+    def quarantine_file(self, file_path):
+        """Quarantine a single file"""
+        try:
+            scanner = AIScanner("")  # Create scanner instance for quarantine methods
+            if scanner.quarantine_file(file_path):
+                QMessageBox.information(self, "Quarantine", f"File quarantined: {os.path.basename(file_path)}")
+                self.parent_ref.add_log_to_db(f"File Quarantined ({os.path.basename(file_path)})", "Success")
+                self.refresh_table()
+            else:
+                QMessageBox.warning(self, "Quarantine Error", f"Failed to quarantine file: {os.path.basename(file_path)}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error quarantining file: {e}")
+    
+    def delete_file(self, file_path):
+        """Delete a single file"""
+        try:
+            reply = QMessageBox.question(
+                self, 
+                "Confirm Delete", 
+                f"Are you sure you want to permanently delete {os.path.basename(file_path)}?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                scanner = AIScanner("")  # Create scanner instance for delete methods
+                if scanner.delete_file(file_path):
+                    QMessageBox.information(self, "Delete", f"File deleted: {os.path.basename(file_path)}")
+                    self.parent_ref.add_log_to_db(f"File Deleted ({os.path.basename(file_path)})", "Success")
+                    self.refresh_table()
+                else:
+                    QMessageBox.warning(self, "Delete Error", f"Failed to delete file: {os.path.basename(file_path)}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error deleting file: {e}")
+    
+    def quarantine_all(self):
+        """Quarantine all detected threats"""
+        try:
+            reply = QMessageBox.question(
+                self, 
+                "Confirm Quarantine", 
+                "Are you sure you want to quarantine all detected threats?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                scanner = AIScanner("")  # Create scanner instance for quarantine methods
+                success_count = 0
+                total_count = len([f for f in self.results['file_list'] if f['status'] in ['Malicious', 'Suspicious']])
+                
+                for item in self.results['file_list']:
+                    if item['status'] in ['Malicious', 'Suspicious']:
+                        if scanner.quarantine_file(item['path']):
+                            success_count += 1
+                
+                QMessageBox.information(
+                    self, 
+                    "Quarantine Complete", 
+                    f"Quarantined {success_count} of {total_count} threats."
+                )
+                self.parent_ref.add_log_to_db(f"Quarantined {success_count} threats", "Success")
+                self.refresh_table()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error quarantining files: {e}")
+    
+    def delete_all(self):
+        """Delete all detected threats"""
+        try:
+            reply = QMessageBox.question(
+                self, 
+                "Confirm Delete", 
+                "Are you sure you want to permanently delete all detected threats?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                scanner = AIScanner("")  # Create scanner instance for delete methods
+                success_count = 0
+                total_count = len([f for f in self.results['file_list'] if f['status'] in ['Malicious', 'Suspicious']])
+                
+                for item in self.results['file_list']:
+                    if item['status'] in ['Malicious', 'Suspicious']:
+                        if scanner.delete_file(item['path']):
+                            success_count += 1
+                
+                QMessageBox.information(
+                    self, 
+                    "Delete Complete", 
+                    f"Deleted {success_count} of {total_count} threats."
+                )
+                self.parent_ref.add_log_to_db(f"Deleted {success_count} threats", "Success")
+                self.refresh_table()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error deleting files: {e}")
+    
+    def refresh_table(self):
+        """Refresh the table after actions"""
+        # Remove rows for files that no longer exist
+        rows_to_remove = []
+        for row in range(self.table.rowCount()):
+            file_path = self.table.item(row, 0).text()
+            if not os.path.exists(file_path):
+                rows_to_remove.append(row)
+        
+        for row in sorted(rows_to_remove, reverse=True):
+            self.table.removeRow(row)
 
 
 class USBBlockDashboard(QWidget):
@@ -626,9 +1241,10 @@ class USBBlockDashboard(QWidget):
     def __init__(self, username):
         super().__init__()
         self.username = username
-        self.setFixedSize(1100, 900)
+        self.setMinimumSize(1100, 900)
         self.setWindowTitle(f"USB Defender - {self.username}")
-        self.setWindowFlags(Qt.FramelessWindowHint)
+        # Remove maximize button from title bar
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowMaximizeButtonHint)
         self.setStyleSheet("background-color: white;")
         self.summary_icons = []
         self.device_status = {
@@ -637,6 +1253,9 @@ class USBBlockDashboard(QWidget):
             "network": True,
             "drive": True
         }
+
+        # Initialize USB port manager
+        self.usb_manager = USBPortManager()
 
         # --- DB path & init ---
         self.db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usb_reports.db")
@@ -648,6 +1267,20 @@ class USBBlockDashboard(QWidget):
 
         # --- Real-time USB detection state ---
         self.current_usb_set = set()  # mountpoints we see right now
+
+        # --- Statistics ---
+        self.stats = {
+            "usb_plugged_in": 0,
+            "usb_blocked": 0,
+            "usb_scanned": 0,
+            "malicious_detected": 0,
+            "disc_inserted": 0,
+            "disc_blocked": 0,
+            "network_accessed": 0,
+            "network_blocked": 0,
+            "drive_accessed": 0,
+            "drive_blocked": 0
+        }
 
         self.init_ui()
         self.center_window()
@@ -699,6 +1332,28 @@ class USBBlockDashboard(QWidget):
                     probability REAL
                 )
             """)
+            
+            # Create table for statistics
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS statistics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    usb_plugged_in INTEGER DEFAULT 0,
+                    usb_blocked INTEGER DEFAULT 0,
+                    usb_scanned INTEGER DEFAULT 0,
+                    malicious_detected INTEGER DEFAULT 0,
+                    disc_inserted INTEGER DEFAULT 0,
+                    disc_blocked INTEGER DEFAULT 0,
+                    network_accessed INTEGER DEFAULT 0,
+                    network_blocked INTEGER DEFAULT 0,
+                    drive_accessed INTEGER DEFAULT 0,
+                    drive_blocked INTEGER DEFAULT 0
+                )
+            """)
+            
+            # Initialize statistics if not exists
+            cur.execute("SELECT COUNT(*) FROM statistics")
+            if cur.fetchone()[0] == 0:
+                cur.execute("INSERT INTO statistics DEFAULT VALUES")
             
             conn.commit()
             conn.close()
@@ -808,6 +1463,53 @@ class USBBlockDashboard(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Database Error", f"Could not clear Reports:\n{e}")
 
+    def load_statistics(self):
+        """Load statistics from database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM statistics LIMIT 1")
+            row = cur.fetchone()
+            conn.close()
+            
+            if row:
+                # Skip the id column
+                self.stats = {
+                    "usb_plugged_in": row[1] or 0,
+                    "usb_blocked": row[2] or 0,
+                    "usb_scanned": row[3] or 0,
+                    "malicious_detected": row[4] or 0,
+                    "disc_inserted": row[5] or 0,
+                    "disc_blocked": row[6] or 0,
+                    "network_accessed": row[7] or 0,
+                    "network_blocked": row[8] or 0,
+                    "drive_accessed": row[9] or 0,
+                    "drive_blocked": row[10] or 0
+                }
+        except Exception as e:
+            print(f"Error loading statistics: {e}")
+
+    def save_statistics(self):
+        """Save statistics to database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE statistics SET 
+                usb_plugged_in = ?, usb_blocked = ?, usb_scanned = ?, malicious_detected = ?,
+                disc_inserted = ?, disc_blocked = ?, network_accessed = ?, network_blocked = ?,
+                drive_accessed = ?, drive_blocked = ?
+            """, (
+                self.stats["usb_plugged_in"], self.stats["usb_blocked"], self.stats["usb_scanned"], 
+                self.stats["malicious_detected"], self.stats["disc_inserted"], self.stats["disc_blocked"],
+                self.stats["network_accessed"], self.stats["network_blocked"], self.stats["drive_accessed"],
+                self.stats["drive_blocked"]
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error saving statistics: {e}")
+
     # ---------- Authorized devices persistence ----------
     def load_authorized_devices(self):
         if os.path.exists(self.auth_store_path):
@@ -816,7 +1518,7 @@ class USBBlockDashboard(QWidget):
                     return json.load(f)
             except Exception:
                 pass
-        return []  # list of dicts: {serial, type, name}
+        return []  # list of dicts: {serial, type, name, mount, size, vendor, product}
 
     def save_authorized_devices(self):
         try:
@@ -837,31 +1539,41 @@ class USBBlockDashboard(QWidget):
     def get_connected_usb_info(self):
         """
         Returns a list of dicts for connected USBs with best-effort details:
-        [{serial, type, name, mount}]
+        [{serial, type, name, mount, size, vendor, product}]
         """
         info_list = []
         mounts = self.list_connected_usb_mounts()
 
         # Basic, cross-platform fallback using mountpoint as ID
         for m in mounts:
-            info = {"serial": m, "type": "USB Storage", "name": os.path.basename(m) or m, "mount": m}
-            info_list.append(info)
-
-        # On Windows, try to enrich with WMI (if available)
-        if platform.system().lower().startswith("win") and HAS_WMI:
+            info = {
+                "serial": m, 
+                "type": "USB Storage", 
+                "name": os.path.basename(m) or m, 
+                "mount": m,
+                "size": "Unknown",
+                "vendor": "Unknown",
+                "product": "Unknown"
+            }
+            
+            # Try to get more detailed information
             try:
-                c = wmi.WMI()
-                for disk in c.Win32_DiskDrive(InterfaceType="USB"):
-                    serial = getattr(disk, "SerialNumber", "") or getattr(disk, "PNPDeviceID", "")
-                    model = getattr(disk, "Model", "USB Storage")
-                    # Leave mount association naive (we already have mounts)
-                    for i in range(len(info_list)):
-                        if info_list[i]["serial"] == info_list[i]["mount"]:
-                            info_list[i]["serial"] = serial or info_list[i]["serial"]
-                            info_list[i]["type"] = "USB Storage"
-                            info_list[i]["name"] = model
+                # Get disk usage information
+                usage = psutil.disk_usage(m)
+                info["size"] = f"{usage.total / (1024**3):.2f} GB"
+                
+                # On Windows, try to get more details using WMI
+                if platform.system().lower().startswith("win") and HAS_WMI:
+                    c = wmi.WMI()
+                    for disk in c.Win32_DiskDrive(InterfaceType="USB"):
+                        info["vendor"] = getattr(disk, "Manufacturer", "Unknown")
+                        info["product"] = getattr(disk, "Model", "Unknown")
+                        info["serial"] = getattr(disk, "SerialNumber", "") or getattr(disk, "PNPDeviceID", "") or m
+                        break
             except Exception:
                 pass
+                
+            info_list.append(info)
 
         return info_list
 
@@ -878,6 +1590,9 @@ class USBBlockDashboard(QWidget):
                 if dev["mount"] in inserted:
                     if not self.is_authorized(dev["serial"]):
                         # Unknown device detected -> Blocked (log)
+                        self.stats["usb_plugged_in"] += 1
+                        self.stats["usb_blocked"] += 1
+                        self.save_statistics()
                         self.add_log_to_db(f"Unauthorized Device Detected ({dev.get('name','Unknown')})", "Blocked")
                         QMessageBox.warning(
                             self,
@@ -889,6 +1604,8 @@ class USBBlockDashboard(QWidget):
                         )
                     else:
                         # Known device -> Allowed (log)
+                        self.stats["usb_plugged_in"] += 1
+                        self.save_statistics()
                         self.add_log_to_db(f"USB Device Connected ({dev.get('name','USB')})", "Allowed")
 
         if removed:
@@ -914,32 +1631,24 @@ class USBBlockDashboard(QWidget):
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(8)
 
-        # --- Title Bar (taller) ---
-        title_bar = QHBoxLayout()
-        title_bar.setContentsMargins(5, 5, 5, 5)
+        # Set window title
+        self.setWindowTitle(f"USB Defender 1.1.1 Beta | Welcome, {self.username}")
 
-        app_name = QLabel(f"USB Defender 1.1.1 Beta | Welcome, {self.username}")
-        app_name.setStyleSheet("color: white; font-weight: bold; font-size: 18px;")
-        title_bar.addWidget(app_name)
-        title_bar.addStretch()
-
-        minimize_btn = QPushButton("-")
-        minimize_btn.setFixedSize(26, 26)
-        minimize_btn.setStyleSheet("color: white; background: none; border: none; font-size: 16px;")
-        minimize_btn.clicked.connect(self.showMinimized)
-
-        close_btn = QPushButton("X")
-        close_btn.setFixedSize(26, 26)
-        close_btn.setStyleSheet("color: white; background: none; border: none; font-size: 16极;")
-        close_btn.clicked.connect(self.close)
-
-        title_bar.addWidget(minimize_btn)
-        title_bar.addWidget(close_btn)
-
-        title_bar_widget = QWidget()
-        title_bar_widget.setStyleSheet("background-color: #c32020; border-top: 5px solid darkred; border-radius: 6px;")
-        title_bar_widget.setLayout(title_bar)
-        main_layout.addWidget(title_bar_widget)
+        # --- Red Bar (replacing the custom title bar) ---
+        red_bar = QLabel(f"USB Defender 1.1.1 Beta | Welcome, {self.username}")
+        red_bar.setStyleSheet("""
+            QLabel {
+                background-color: #c32020;
+                color: white;
+                font-weight: bold;
+                font-size: 18px;
+                padding: 10px;
+                border-top: 5px solid darkred;
+                border-radius: 6px;
+            }
+        """)
+        red_bar.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(red_bar)
 
         # --- Top Menu (single container box) ---
         menu_layout = QHBoxLayout()
@@ -981,6 +1690,9 @@ class USBBlockDashboard(QWidget):
 
         main_layout.addWidget(self.stack)
         self.setLayout(main_layout)
+
+        # Load statistics
+        self.load_statistics()
 
     def create_detailed_summary_page(self):
         page = QWidget()
@@ -1047,11 +1759,30 @@ class USBBlockDashboard(QWidget):
         logs_layout.setContentsMargins(10, 0, 10, 10)
         logs_layout.setSpacing(20)
 
+        # Update reports with actual statistics
         reports = [
-            ("USB Devices Report", ["Times Plugged-in: 0", "USB  Blocked: 0", "Authorized USBs: 0"]),
-            ("Disc Drives Report", ["Times Inserted: 0", "Discs  Blocked: 0", "Authorized DISCs: 0"]),
-            ("Network Access Report", ["Times Accessed: 0", "Network Blocked: 0", "Authorized Networks:0"]),
-            ("Non-System Drives Report", ["Times Accessed: 0", "Drives Blocked: 0", "Authorized Drives: 0"])
+            ("USB Devices Report", [
+                f"Times Plugged-in: {self.stats['usb_plugged_in']}", 
+                f"USB Blocked: {self.stats['usb_blocked']}", 
+                f"USB Scanned: {self.stats['usb_scanned']}",
+                f"Malicious Detected: {self.stats['malicious_detected']}",
+                f"Authorized USBs: {len(self.authorized_devices)}"
+            ]),
+            ("Disc Drives Report", [
+                f"Times Inserted: {self.stats['disc_inserted']}", 
+                f"Discs Blocked: {self.stats['disc_blocked']}", 
+                "Authorized DISCs: 0"
+            ]),
+            ("Network Access Report", [
+                f"Times Accessed: {self.stats['network_accessed']}", 
+                f"Network Blocked: {self.stats['network_blocked']}", 
+                "Authorized Networks:0"
+            ]),
+            ("Non-System Drives Report", [
+                f"Times Accessed: {self.stats['drive_accessed']}", 
+                f"Drives Blocked: {self.stats['drive_blocked']}", 
+                "Authorized Drives: 0"
+            ])
         ]
 
         for i, (title, lines) in enumerate(reports):
@@ -1316,6 +2047,46 @@ class USBBlockDashboard(QWidget):
                 # Emit signal to update summary page
                 self.status_changed.emit(dev_type, not checked)
                 
+                # For USB devices, implement real blocking
+                if dev_type == "usb":
+                    if checked:
+                        # Block USB ports
+                        if self.usb_manager.block_usb_ports():
+                            self.add_log_to_db("USB Ports Blocked", "Success")
+                            self.stats["usb_blocked"] += 1
+                            self.save_statistics()
+                        else:
+                            QMessageBox.warning(self, "USB Blocking", "Failed to block USB ports. Administrator privileges may be required.")
+                    else:
+                        # Unblock USB ports
+                        if self.usb_manager.unblock_usb_ports():
+                            self.add_log_to_db("USB Ports Unblocked", "Success")
+                        else:
+                            QMessageBox.warning(self, "USB Unblocking", "Failed to unblock USB ports. Administrator privileges may be required.")
+                
+                # For other device types, just update the status
+                elif dev_type == "disc":
+                    if checked:
+                        self.add_log_to_db("Disc Drives Blocked", "Success")
+                        self.stats["disc_blocked"] += 1
+                    else:
+                        self.add_log_to_db("Disc Drives Unblocked", "Success")
+                elif dev_type == "network":
+                    if checked:
+                        self.add_log_to_db("Network Access Blocked", "Success")
+                        self.stats["network_blocked"] += 1
+                    else:
+                        self.add_log_to_db("Network Access Unblocked", "Success")
+                elif dev_type == "drive":
+                    if checked:
+                        self.add_log_to_db("Non-System Drives Blocked", "Success")
+                        self.stats["drive_blocked"] += 1
+                    else:
+                        self.add_log_to_db("Non-System Drives Unblocked", "Success")
+                
+                self.save_statistics()
+                self.update_summary_page()
+
             chk.stateChanged.connect(lambda state, lbl=status_lbl, dev_type=device_type: toggle_status(state == Qt.Checked, lbl, dev_type))
 
             item_widget.setStyleSheet("""
@@ -1357,6 +2128,15 @@ class USBBlockDashboard(QWidget):
 
         return page
 
+    def update_summary_page(self):
+        """Update the summary page with current statistics"""
+        if hasattr(self, 'summary_labels'):
+            for device_key, label in self.summary_labels.items():
+                status = "Allowed" if self.device_status[device_key] else "Disallowed"
+                color = "green" if self.device_status[device_key] else "red"
+                current_text = label.text().split('<br>')[0]  # Get the device name part
+                label.setText(f"{current_text}<br><u><b>Status</b></u> : <span style='color: {color}; font-size: 10px'>{status}</span>")
+
     def scan_usb(self):
         """Scan USB drive for viruses using AI"""
         usb_found = False
@@ -1370,12 +2150,9 @@ class USBBlockDashboard(QWidget):
             QMessageBox.warning(self, "USB Scan", "No USB device detected!")
             return
             
-        # Create progress dialog
-        self.progress_dialog = QProgressDialog("Scanning USB drive...", "Cancel", 0, 100, self)
-        self.progress_dialog.setWindowTitle("AI Scanning")
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
-        self.progress_dialog.setAutoClose(True)
-        self.progress_dialog.setAutoReset(True)
+        # Create custom progress dialog
+        self.progress_dialog = ScanProgressDialog(self)
+        self.progress_dialog.show()
         
         # Create and start scanner thread
         self.scanner_thread = AIScanner(usb_path)
@@ -1388,16 +2165,30 @@ class USBBlockDashboard(QWidget):
         
     def update_scan_progress(self, progress, file_name):
         """Update progress dialog with current status"""
-        self.progress_dialog.setValue(progress)
-        self.progress_dialog.setLabelText(f"Scanning: {file_name}")
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            self.progress_dialog.update_progress(progress, f"Scanning: {file_name}")
+            
+            # Check if user cancelled
+            if self.progress_dialog.cancelled:
+                self.scanner_thread.terminate()
+                self.progress_dialog.close()
+                self.add_log_to_db("Scan Cancelled", "User Cancelled")
+                QMessageBox.information(self, "Scan Cancelled", "The scan was cancelled by the user.")
         
     def handle_scan_results(self, results):
         """Handle scan completion"""
-        self.progress_dialog.close()
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            self.progress_dialog.close()
         
         # Save results to database
-        for item in results['malicious_list']:
-            self.add_scan_result_to_db(item['path'], item['status'], item['probability'])
+        for item in results['file_list']:
+            if item['status'] in ['Malicious', 'Suspicious']:
+                self.add_scan_result_to_db(item['path'], item['status'], item['probability'])
+        
+        # Update statistics
+        self.stats["usb_scanned"] += results['scanned_files']
+        self.stats["malicious_detected"] += results['malicious_files'] + results['suspicious_files']
+        self.save_statistics()
         
         # Show results dialog
         result_dialog = ScanResultDialog(results, self)
@@ -1407,6 +2198,8 @@ class USBBlockDashboard(QWidget):
         status = "Completed"
         if results['malicious_files'] > 0 or results['suspicious_files'] > 0:
             status = "Threats Found"
+            
+        # FIX: Use 'scanned_files' instead of 'scanned'
         self.add_log_to_db(f"Scan Completed ({results['scanned_files']} files)", status)
         
         # Show summary message
@@ -1478,6 +2271,7 @@ class USBBlockDashboard(QWidget):
             background-color: #fff8f8;
             border: 1px solid #f2b6b6;
             border-radius: 8px;
+            padding: 10px;
         """)
         tw_layout = QVBoxLayout(title_wrap)
         tw_layout.setContentsMargins(12, 8, 12, 8)
@@ -1491,8 +2285,8 @@ class USBBlockDashboard(QWidget):
 
         # Table
         self.auth_table = QTableWidget()
-        self.auth_table.setColumnCount(3)
-        self.auth_table.setHorizontalHeaderLabels(["Serial No.", "Device Type", "Device Name (with ID)"])
+        self.auth_table.setColumnCount(6)
+        self.auth_table.setHorizontalHeaderLabels(["Serial No.", "Device Type", "Device Name", "Mount Point", "Size", "Vendor/Product"])
         self.auth_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.auth_table.setSelectionBehavior(self.auth_table.SelectRows)
         self.auth_table.setSelectionMode(self.auth_table.SingleSelection)
@@ -1518,28 +2312,73 @@ class USBBlockDashboard(QWidget):
             self.auth_table.setItem(r, 0, QTableWidgetItem(item.get("serial", "")))
             self.auth_table.setItem(r, 1, QTableWidgetItem(item.get("type", "")))
             self.auth_table.setItem(r, 2, QTableWidgetItem(item.get("name", "")))
+            self.auth_table.setItem(r, 3, QTableWidgetItem(item.get("mount", "")))
+            self.auth_table.setItem(r, 4, QTableWidgetItem(item.get("size", "Unknown")))
+            self.auth_table.setItem(r, 5, QTableWidgetItem(f"{item.get('vendor', 'Unknown')}/{item.get('product', 'Unknown')}"))
 
     def add_connected_usb_as_authorized(self):
         devices = self.get_connected_usb_info()
         if not devices:
             QMessageBox.information(self, "Authorized Devices", "No connected USB storage found.")
             return
-        # Pick the first device that isn't authorized yet
-        for dev in devices:
-            if not self.is_authorized(dev["serial"]):
-                self.authorized_devices.append({"serial": dev["serial"], "type": dev["type"], "name": dev["name"]})
-                self.save_authorized_devices()
-                self.populate_authorized_table()
-                self.add_log_to_db(f"Device Authorized ({dev['name']})", "Allowed")
-                QMessageBox.information(self, "Authorized Devices", f"Device added:\n\nName: {dev['name']}\nSerial: {dev['serial']}")
-                return
-        QMessageBox.information(self, "Authorized Devices", "All connected USB devices are already authorized.")
+        
+        # Show device selection dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select USB Device to Authorize")
+        dialog.setMinimumWidth(600)
+        
+        layout = QVBoxLayout()
+        
+        label = QLabel("Select a USB device to add to authorized list:")
+        layout.addWidget(label)
+        
+        table = QTableWidget()
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["Serial No.", "Device Type", "Device Name", "Mount Point", "Size", "Vendor/Product"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setSelectionBehavior(table.SelectRows)
+        table.setSelectionMode(table.SingleSelection)
+        
+        table.setRowCount(len(devices))
+        for r, dev in enumerate(devices):
+            table.setItem(r, 0, QTableWidgetItem(dev.get("serial", "")))
+            table.setItem(r, 1, QTableWidgetItem(dev.get("type", "")))
+            table.setItem(r, 2, QTableWidgetItem(dev.get("name", "")))
+            table.setItem(r, 3, QTableWidgetItem(dev.get("mount", "")))
+            table.setItem(r, 4, QTableWidgetItem(dev.get("size", "Unknown")))
+            table.setItem(r, 5, QTableWidgetItem(f"{dev.get('vendor', 'Unknown')}/{dev.get('product', 'Unknown')}"))
+        
+        layout.addWidget(table)
+        
+        button_box = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_box.addWidget(cancel_btn)
+        
+        select_btn = QPushButton("Select Device")
+        select_btn.clicked.connect(dialog.accept)
+        button_box.addWidget(select_btn)
+        
+        layout.addLayout(button_box)
+        dialog.setLayout(layout)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            selected_row = table.currentRow()
+            if selected_row >= 0:
+                dev = devices[selected_row]
+                if not self.is_authorized(dev["serial"]):
+                    self.authorized_devices.append(dev)
+                    self.save_authorized_devices()
+                    self.populate_authorized_table()
+                    self.add_log_to_db(f"Device Authorized ({dev['name']})", "Allowed")
+                    QMessageBox.information(self, "Authorized Devices", f"Device added:\n\nName: {dev['name']}\nSerial: {dev['serial']}")
+                else:
+                    QMessageBox.information(self, "Authorized Devices", "This device is already authorized.")
 
     def remove_selected_authorized(self):
         row = self.auth_table.currentRow()
         if row < 0:
             QMessageBox.information(self, "Authorized Devices", "Please select a device to remove.")
-            return
         serial = self.auth_table.item(row, 0).text() if self.auth_table.item(row, 0) else ""
         name = self.auth_table.item(row, 2).text() if self.auth_table.item(row, 2) else serial
         self.authorized_devices = [d for d in self.authorized_devices if d.get("serial") != serial]
@@ -1868,13 +2707,15 @@ class USBBlockDashboard(QWidget):
             # Refresh hack attempts when visiting program options
             elif index == 4 and getattr(self, "hack_table", None):
                 self.load_hack_attempts_table()
+            # Refresh statistics when visiting detailed summary
+            elif index == 0:
+                self.load_statistics()
+                # Update the detailed summary page with latest statistics
+                self.update_summary_page()
 
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     win = USBBlockDashboard("Guest")
     win.show()
-    sys.exit(app.exec_())  
-## This application is not fully functionable . I am working on it daily and will make it complete soon.
-## sql lite is addedd . solve the issue of password changes real time usb monitoring and real time database update
-
+    sys.exit(app.exec_())
